@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
 	"log"
 	"math/big"
 	"net/http"
@@ -33,16 +32,6 @@ import (
 
 var store = sessions.NewCookieStore([]byte("duo-rox"))
 
-// renderTemplate renders the template to the ResponseWriter
-func renderTemplate(w http.ResponseWriter, f string, data interface{}) {
-	t, err := template.ParseFiles(fmt.Sprintf("./templates/%s", f))
-	if err != nil {
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
-		return
-	}
-	t.Execute(w, data)
-}
-
 // JSONResponse attempts to set the status code, c, and marshal the given
 // interface, d, into a response that is written to the given ResponseWriter.
 func JSONResponse(w http.ResponseWriter, d interface{}, c int) {
@@ -53,51 +42,6 @@ func JSONResponse(w http.ResponseWriter, d interface{}, c int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(c)
 	fmt.Fprintf(w, "%s", dj)
-}
-
-// Index returns the static index template
-func Index(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	username := vars["name"]
-
-	if username == "" {
-		fmt.Println("Getting default user for dashboard")
-		username = "testuser@example.com"
-	}
-
-	user, err := models.GetUserByUsername(username + "@example.com")
-
-	if err != nil {
-		fmt.Println("Error retreiving user for dashboard: ", err)
-		JSONResponse(w, "Error retreiving user", http.StatusInternalServerError)
-		return
-	}
-
-	type TemplateData struct {
-		User        string
-		Credentials []res.FormattedCredential
-	}
-
-	creds, err := models.GetCredentialsForUser(&user)
-
-	fcs, err := res.FormatCredentials(creds)
-
-	td := TemplateData{
-		User:        user.DisplayName,
-		Credentials: fcs,
-	}
-
-	renderTemplate(w, "index.html", td)
-}
-
-// Login returns the static login page
-func Login(w http.ResponseWriter, r *http.Request) {
-	renderTemplate(w, "login.html", nil)
-}
-
-// LoginHello returns the static login page for Windows Hello Requests
-func LoginHello(w http.ResponseWriter, r *http.Request) {
-	renderTemplate(w, "winlogin.html", nil)
 }
 
 // RequestNewCredential begins Credential Registration Request when /MakeNewCredential gets hit
@@ -940,11 +884,7 @@ func DeleteCredential(w http.ResponseWriter, r *http.Request) {
 func CreateRouter() http.Handler {
 	router := mux.NewRouter()
 	// New handlers should be added here
-	router.HandleFunc("/", Login)
-	router.HandleFunc("/hello", LoginHello)                                                        // Handle Windows Hello Page
 	router.HandleFunc("/hello/makeCredential/{name}", hello.MakeNewHelloCredential).Methods("GET") // Make Windows Hello Credential
-	router.HandleFunc("/dashboard/{name}", Index)
-	router.HandleFunc("/dashboard", Index)
 	router.HandleFunc("/makeCredential/{name}", RequestNewCredential).Methods("GET")
 	router.HandleFunc("/makeCredential", MakeNewCredential).Methods("POST")
 	router.HandleFunc("/assertion/{name}", GetAssertion).Methods("GET")
