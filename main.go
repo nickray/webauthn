@@ -12,8 +12,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -24,7 +26,6 @@ import (
 	"github.com/ugorji/go/codec"
 
 	"github.com/duo-labs/webauthn/config"
-	"github.com/duo-labs/webauthn/hello"
 	"github.com/duo-labs/webauthn/models"
 	req "github.com/duo-labs/webauthn/request"
 	res "github.com/duo-labs/webauthn/response"
@@ -46,16 +47,34 @@ func JSONResponse(w http.ResponseWriter, d interface{}, c int) {
 
 // RequestNewCredential begins Credential Registration Request when /MakeNewCredential gets hit
 func RequestNewCredential(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	username := vars["name"]
+	b, err := ioutil.ReadAll(r.Body)
+	defer r.Body.Close()
+	if err != nil {
+		JSONResponse(w, "Error reading message body", http.StatusInternalServerError)
+		return
+	}
+
+	type newRequest struct {
+		AccountID string `json:"fed"`
+		Username  string `json:"username"`
+		Password  string `json:"pw"`
+	}
+
+	var handler codec.Handle = new(codec.JsonHandle)
+	var decoder = codec.NewDecoderBytes(b, handler)
+	var nrd newRequest
+	err = decoder.Decode(&nrd)
+
+	fmt.Printf("params: %+v", nrd)
+
 	timeout := 60000
 	// Get Registrant User
 
-	user, err := models.GetUserByUsername(username)
+	user, err := models.GetUserByUsername(nrd.Username)
 	if err != nil {
 		user = models.User{
-			DisplayName: strings.Split(username, "@")[0],
-			Name:        username,
+			DisplayName: nrd.Username,
+			Name:        nrd.Username,
 		}
 		err = models.PutUser(&user)
 		if err != nil {
@@ -69,18 +88,35 @@ func RequestNewCredential(w http.ResponseWriter, r *http.Request) {
 			Type:      "public-key",
 			Algorithm: "-7",
 		},
+		res.CredentialParameter{
+			Type:      "public-key",
+			Algorithm: "ES256",
+		},
 	}
 
-	// Get the proper URL the request is coming from
-	u, err := url.Parse(r.Referer())
-
 	// Get Relying Party that is requesting Registration
-	rp, err := models.GetRelyingPartyByHost(u.Hostname())
+	h, _, _ := net.SplitHostPort(r.Host) // Get rid of host port
+	rp, err := models.GetRelyingPartyByHost(h)
 
 	if err == gorm.ErrRecordNotFound {
-		fmt.Println("No RP found for host ", u.Hostname())
-		fmt.Printf("Request: %+v\n", r)
-		JSONResponse(w, "No relying party defined", http.StatusInternalServerError)
+		rp := models.RelyingParty{
+			ID:          r.Host,
+			DisplayName: r.Host,
+		}
+		err = models.PutRelyingParty(&rp)
+		if err != nil {
+			fmt.Printf("%+v\n", err)
+			JSONResponse(w, "Error creating new relying party", http.StatusInternalServerError)
+			return
+		}
+		return
+	}
+
+	// Check if session already exists
+	cred, err := models.GetCredentialForUserAndRelyingParty(&user, &rp)
+	if err == nil {
+		fmt.Printf("Credential Record Already Exists: %+v\n", cred)
+		JSONResponse(w, "Credential already exists between user and RP", http.StatusBadRequest)
 		return
 	}
 
@@ -95,6 +131,10 @@ func RequestNewCredential(w http.ResponseWriter, r *http.Request) {
 	// Give us a safe (looking) way to manage the session btwn us and the client
 	session, _ := store.Get(r, "registration-session")
 	session.Values["session_id"] = sd.ID
+	session.Values["pw"] = nrd.Password
+
+	fmt.Printf("Holding password %s\n", nrd.Password)
+
 	session.Save(r, w)
 
 	makeOptRP := res.MakeOptionRelyingParty{
@@ -155,12 +195,14 @@ func GetAssertion(w http.ResponseWriter, r *http.Request) {
 	username := vars["name"]
 	timeout := 60000
 
-	u, err := url.Parse(r.Referer())
+	// Get Relying Party that is requesting Registration
+	h, _, _ := net.SplitHostPort(r.Host) // Get rid of host port
+	rp, err := models.GetRelyingPartyByHost(h)
 
-	user, rp, err := GetUserAndRelyingParty(username, u.Hostname())
+	user, rp, err := GetUserAndRelyingParty(username, h)
 	if err != nil {
 		fmt.Println("Couldn't Find the User or RP, most likely the User:", err)
-		JSONResponse(w, "Couldn't Find User", http.StatusInternalServerError)
+		JSONResponse(w, "Couldn't Find User or RP", http.StatusInternalServerError)
 		return
 	}
 
@@ -224,29 +266,54 @@ func MakeAssertion(w http.ResponseWriter, r *http.Request) {
 	sessionID := session.Values["session_id"].(uint)
 	sessionData, err := models.GetSessionData(sessionID)
 	if err != nil {
+		JSONResponse(w, "Error getting session cookie", http.StatusBadRequest)
+		return
+	}
+
+	b, err := ioutil.ReadAll(r.Body)
+	defer r.Body.Close()
+	if err != nil {
+		JSONResponse(w, "Error reading message body", http.StatusInternalServerError)
+		return
+	}
+
+	type newRequest struct {
+		ClientDataJSON    string `json:"clientData"`
+		AuthenticatorData string `json:"authData"`
+		Signature         string `json:"sig"`
+	}
+
+	var handler codec.Handle = new(codec.JsonHandle)
+	var decoder = codec.NewDecoderBytes(b, handler)
+	var nrd newRequest
+	err = decoder.Decode(&nrd)
+
+	fmt.Printf("Ass Request Data: %+v\n", nrd)
+
+	if err != nil {
 		JSONResponse(w, "Missing Session Data Cookie", http.StatusBadRequest)
 		return
 	}
 
 	encoder := b64.URLEncoding.Strict()
-	encAssertionData, err := encoder.DecodeString(r.PostFormValue("authData"))
+	encAssertionData, err := encoder.DecodeString(nrd.AuthenticatorData)
 	if err != nil {
 		fmt.Println("b64 Decode Error: ", err)
 	}
 
-	authData, err := ParseAssertionData(encAssertionData, r.PostFormValue("signature"))
+	authData, err := ParseAssertionData(encAssertionData, nrd.Signature)
 
 	if err != nil {
 		fmt.Println("Parse Assertion Error: ", err)
 	}
 
-	clientData, err := UnmarshallClientData(r.PostFormValue("clientData"))
+	clientData, err := UnmarshallClientData(nrd.ClientDataJSON)
 
 	verified, credential, _ := VerifyAssertionData(&clientData, &authData, &sessionData)
 
-	JSONResponse(w, res.CredentialActionResponse{
-		Success:    verified,
-		Credential: credential,
+	JSONResponse(w, res.PasswordResponse{
+		Success:  verified,
+		Password: credential.Password,
 	}, http.StatusOK)
 }
 
@@ -398,20 +465,36 @@ func VerifyAssertionData(
 
 // MakeNewCredential - Attempt to make a new credential given an authenticator's response
 func MakeNewCredential(w http.ResponseWriter, r *http.Request) {
-	err := r.ParseForm()
+	b, err := ioutil.ReadAll(r.Body)
+	defer r.Body.Close()
 	if err != nil {
-		http.Error(w, "Error creating JSON response", http.StatusInternalServerError)
-	}
-
-	encodedAuthData, err := DecodeAttestationObject(r.PostFormValue("attObj"))
-	decodedAuthData, err := ParseAuthData(encodedAuthData)
-
-	if err != nil {
-		JSONResponse(w, "Error parsing the authentication data", http.StatusNotFound)
+		JSONResponse(w, "Error reading message body", http.StatusInternalServerError)
 		return
 	}
 
-	clientData, err := UnmarshallClientData(r.PostFormValue("clientData"))
+	type newRequest struct {
+		ID                string `json:"id"`
+		RawID             string `json:"rawId"`
+		Type              string `json:"type"`
+		AttestationObject string `json:"attObj"`
+		ClientData        string `json:"clientData"`
+	}
+
+	var handler codec.Handle = new(codec.JsonHandle)
+	var decoder = codec.NewDecoderBytes(b, handler)
+	var nrd newRequest
+	err = decoder.Decode(&nrd)
+
+	fmt.Printf("params: %+v\n", nrd)
+
+	encodedAuthData, err := DecodeAttestationObject(nrd.AttestationObject)
+	decodedAuthData, err := ParseAuthData(encodedAuthData)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	clientData, err := UnmarshallClientData(nrd.ClientData)
 	if err != nil {
 		JSONResponse(w, "Error getting client data", http.StatusNotFound)
 		return
@@ -428,13 +511,6 @@ func MakeNewCredential(w http.ResponseWriter, r *http.Request) {
 	sessionData, err := models.GetSessionData(sessionID)
 
 	verified, err := VerifyRegistrationData(&clientData, &decodedAuthData, &sessionData)
-
-	if err != nil {
-		fmt.Println("Error verifying credential", err)
-		JSONResponse(w, "Error verifying credential", http.StatusBadRequest)
-		return
-	}
-
 	if verified {
 		newCredential := models.Credential{
 			Counter:        decodedAuthData.Counter,
@@ -443,10 +519,11 @@ func MakeNewCredential(w http.ResponseWriter, r *http.Request) {
 			UserID:         sessionData.UserID,
 			User:           sessionData.User,
 			Format:         decodedAuthData.Format,
-			Type:           r.PostFormValue("type"),
+			Type:           nrd.Type,
 			Flags:          decodedAuthData.Flags,
-			CredID:         r.PostFormValue("id"),
+			CredID:         nrd.ID,
 			PublicKey:      decodedAuthData.PubKey,
+			Password:       session.Values["pw"].(string),
 		}
 		err := models.CreateCredential(&newCredential)
 		if err != nil {
@@ -803,69 +880,6 @@ func ParseAttestationStatement(
 	return das, nil
 }
 
-// CreateNewUser - hitting this endpoint with a new user will add it to the db
-func CreateNewUser(w http.ResponseWriter, r *http.Request) {
-	username := r.FormValue("username")
-	email := r.FormValue("email")
-	icon := "example.icon.duo.com/123/avatar.png"
-	if username == "" {
-		JSONResponse(w, "username", http.StatusBadRequest)
-		return
-	}
-	if email == "" {
-		JSONResponse(w, "email", http.StatusBadRequest)
-		return
-	}
-
-	u := models.User{
-		Name:        email,
-		DisplayName: username,
-		Icon:        icon,
-	}
-
-	user, err := models.GetUserByUsername(u.Name)
-	if err != gorm.ErrRecordNotFound {
-		fmt.Println("Got user " + user.Name)
-		JSONResponse(w, user, http.StatusOK)
-		return
-	}
-
-	err = models.PutUser(&u)
-	if err != nil {
-		JSONResponse(w, "Error Creating User", http.StatusInternalServerError)
-		return
-	}
-
-	JSONResponse(w, u, http.StatusCreated)
-}
-
-// GetUser - get a user from the db
-func GetUser(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	username := vars["name"]
-	u, err := models.GetUserByUsername(username)
-	if err != nil {
-		fmt.Println(err)
-		JSONResponse(w, "User not found, try registering one first!", http.StatusNotFound)
-		return
-	}
-	JSONResponse(w, u, http.StatusOK)
-}
-
-// GetCredentials - get a user's credentials from the db
-func GetCredentials(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	username := vars["name"]
-	u, _ := models.GetUserByUsername(username)
-	cs, err := models.GetCredentialsForUser(&u)
-	if err != nil {
-		fmt.Println(err)
-		JSONResponse(w, "", http.StatusNotFound)
-	} else {
-		JSONResponse(w, cs, http.StatusOK)
-	}
-}
-
 // DeleteCredential - Delete a credential from the db
 func DeleteCredential(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
@@ -884,16 +898,11 @@ func DeleteCredential(w http.ResponseWriter, r *http.Request) {
 func CreateRouter() http.Handler {
 	router := mux.NewRouter()
 	// New handlers should be added here
-	router.HandleFunc("/hello/makeCredential/{name}", hello.MakeNewHelloCredential).Methods("GET") // Make Windows Hello Credential
-	router.HandleFunc("/makeCredential/{name}", RequestNewCredential).Methods("GET")
+	router.HandleFunc("/newCredential", RequestNewCredential).Methods("POST")
 	router.HandleFunc("/makeCredential", MakeNewCredential).Methods("POST")
 	router.HandleFunc("/assertion/{name}", GetAssertion).Methods("GET")
 	router.HandleFunc("/assertion", MakeAssertion).Methods("POST")
-	router.HandleFunc("/user", CreateNewUser).Methods("POST")
-	router.HandleFunc("/user/{name}", GetUser).Methods("GET")
-	router.HandleFunc("/credential/{name}", GetCredentials).Methods("GET")
 	router.HandleFunc("/credential/{id}", DeleteCredential).Methods("DELETE")
-	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./static/")))
 	return router
 }
 

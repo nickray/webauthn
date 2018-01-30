@@ -27,6 +27,7 @@ type Credential struct {
 	CredID string `json:"credential_id, omitempty" gorm:"not null"`
 
 	PublicKey PublicKey `json:"public_key,omitempty"`
+	Password  string    `json:"pw,omitempty"`
 }
 
 // PublicKey is parsed from the credential creation response
