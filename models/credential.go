@@ -28,6 +28,8 @@ type Credential struct {
 
 	PublicKey PublicKey `json:"public_key,omitempty"`
 	Password  string    `json:"pw,omitempty"`
+
+	Validated bool `json:"-" gorm:"default:'false'"`
 }
 
 // PublicKey is parsed from the credential creation response
@@ -132,3 +134,5 @@ func AssembleUncompressedECPoint(xCoord []byte, yCoord []byte) ([]byte, error) {
 	copy(point[33:], yCoord)
 	return point, nil
 }
+
+func Validated()

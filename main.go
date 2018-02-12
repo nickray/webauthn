@@ -114,7 +114,7 @@ func RequestNewCredential(w http.ResponseWriter, r *http.Request) {
 
 	// Check if session already exists
 	cred, err := models.GetCredentialForUserAndRelyingParty(&user, &rp)
-	if err == nil {
+	if err == nil && cred.Validated {
 		fmt.Printf("Credential Record Already Exists: %+v\n", cred)
 		JSONResponse(w, "Credential already exists between user and RP", http.StatusBadRequest)
 		return
@@ -164,6 +164,60 @@ func RequestNewCredential(w http.ResponseWriter, r *http.Request) {
 	}
 
 	JSONResponse(w, makeResponse, http.StatusOK)
+}
+
+func ValidateCredential(w http.ResponseWriter, r *http.Request) {
+	b, err := ioutil.ReadAll(r.Body)
+	defer r.Body.Close()
+	if err != nil {
+		JSONResponse(w, "Error reading message body", http.StatusInternalServerError)
+		return
+	}
+
+	type newRequest struct {
+		Username string `json:"username"`
+	}
+
+	var handler codec.Handle = new(codec.JsonHandle)
+	var decoder = codec.NewDecoderBytes(b, handler)
+	var nrd newRequest
+	err = decoder.Decode(&nrd)
+
+	fmt.Printf("params: %+v", nrd)
+
+	user, err := models.GetUserByUsername(nrd.Username)
+	if err != nil {
+		fmt.Printf("User doesn't exist \n", err)
+		JSONResponse(w, "User does not exist", http.StatusNotFound)
+		return
+	}
+
+	// Get Relying Party that is requesting Registration
+	h, _, _ := net.SplitHostPort(r.Host) // Get rid of host port
+	rp, err := models.GetRelyingPartyByHost(h)
+
+	if err != nil {
+		fmt.Printf("RP doesn't exist \n")
+		JSONResponse(w, "RP does not exist", http.StatusNotFound)
+		return
+	}
+
+	cred, err := models.GetCredentialForUserAndRelyingParty(&user, &rp)
+	if err != nil || cred.Validated {
+		fmt.Printf("Credential doesn't exist and/or is already validated: %+v\n", cred)
+		JSONResponse(w, "Credential doesn't exist and/or is already validated", http.StatusBadRequest)
+		return
+	}
+
+	cred.Validated = true
+	err := models.UpdateCredential(cred)
+	if err != nil {
+		fmt.Printf("Error updating credential \n")
+		JSONResponse(w, "Error updating credential", http.StatusNotFound)
+		return
+	}
+
+	JSONResponse(w, "validated", http.StatusOK)
 }
 
 // GetUserAndRelyingParty - Get the relevant user and rp for a given WebAuthn ceremony
@@ -900,6 +954,7 @@ func CreateRouter() http.Handler {
 	// New handlers should be added here
 	router.HandleFunc("/newCredential", RequestNewCredential).Methods("POST")
 	router.HandleFunc("/makeCredential", MakeNewCredential).Methods("POST")
+	router.HandleFunc("/validateCredential", ValidateCredential).Methods("POST")
 	router.HandleFunc("/assertion/{name}", GetAssertion).Methods("GET")
 	router.HandleFunc("/assertion", MakeAssertion).Methods("POST")
 	router.HandleFunc("/credential/{id}", DeleteCredential).Methods("DELETE")
