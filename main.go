@@ -1005,7 +1005,7 @@ func CreateRouter() http.Handler {
 }
 
 func main() {
-	config.LoadConfig("config.json")
+	config.LoadConfig("./config.json")
 	fmt.Printf("Config: %+v\n", config.Conf)
 	err := models.Setup()
 	if err != nil {
